@@ -13,6 +13,13 @@ import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import org.matrix.vector.util.Utils
 import org.matrix.vector.impl.di.VectorBootstrap
+import org.matrix.vector.impl.hookrule.HookBackend
+import org.matrix.vector.impl.hookrule.HookBackendSelector
+import org.matrix.vector.impl.hookrule.HookLayer
+import org.matrix.vector.impl.hookrule.HookRuleStore
+import org.matrix.vector.impl.hookrule.HookRuleSupport
+import org.matrix.vector.impl.hookrule.PineBackend
+import org.matrix.vector.impl.hookrule.SelectionResult
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
@@ -86,6 +93,16 @@ class VectorHookBuilder(
         // A framework hook. No module, so no id to scope and nothing to serialise against.
         val moduleId = this.moduleId ?: return register(record, null)
 
+        // Per-hook rule gate. A hook the profile disables for this target is declared but not
+        // installed: we still return a live, inert handle so the module's code keeps the shape it
+        // had (unhook works, ids resolve) without any native record existing. The id used for the
+        // decision is the stable one, explicit `setId` or the synthetic fallback.
+        val ruleId = id ?: HookRuleSupport.syntheticId(origin)
+        val profile = HookRuleStore.profileFor(moduleId)
+        if (!profile.isEnabled(ruleId, HookLayer.ART)) {
+            return VectorHookRegistry.registerDisabled(origin, moduleId, ruleId, record)
+        }
+
         synchronized(VectorHookRegistry.lockOf(moduleId)) {
             // Checked again under the lock a reload takes to freeze old code, so a registration
             // cannot slip in between the check above and the snapshot the successor is handed.
@@ -114,19 +131,71 @@ class VectorHookBuilder(
 
     /** Installs [record] natively and records the handle against its owner. */
     private fun register(record: VectorHookRecord, moduleId: String?): HookHandle {
-        if (
-            !HookBridge.hookMethod(
-                true,
-                origin,
-                VectorNativeHooker::class.java,
-                record.priority,
-                record,
-            )
-        ) {
+        // Which backend installs this hook. A framework hook has no module and no rule, so it is
+        // AUTO; a module hook reads its rule. The selector then owns the decision: it folds a
+        // redundant request into the backend that already owns the site, and refuses a request
+        // that would put two layers on one executable.
+        val hookId = record.id ?: HookRuleSupport.syntheticId(origin)
+        val requested =
+            if (moduleId == null) HookBackend.AUTO
+            else HookRuleStore.profileFor(moduleId).backendFor(hookId, HookLayer.ART)
+
+        // A framework hook is never routed through the selector: it has no module to scope a site
+        // to, and the selector's exclusivity is a property of module hooks. It installs on LSPlant,
+        // the framework's own ART backend, exactly as before.
+        if (moduleId == null) {
+            if (
+                !HookBridge.hookMethodWithBackend(
+                    true,
+                    origin,
+                    VectorNativeHooker::class.java,
+                    record.priority,
+                    record,
+                    HookBackend.LSPLANT.ordinal,
+                )
+            ) {
+                throw HookFailedError("Cannot hook $origin")
+            }
+            return VectorHookHandle(origin, null, record)
+        }
+
+        val site = HookRuleStore.siteFor(moduleId, HookLayer.ART, hookId)
+        val executableKey = HookRuleSupport.executableKey(origin)
+        val effective =
+            when (val result = HookBackendSelector.select(site, requested, executableKey)) {
+                is SelectionResult.Selected -> result.effective
+                is SelectionResult.Failed ->
+                    throw HookFailedError("Cannot hook $origin: ${result.reason}")
+            }
+
+        // The selector's answer, dispatched to the engine that implements it. LSPlant runs
+        // through the native bridge, the same path every hook used before this change; Pine is a
+        // Kotlin-level install that owns the chain itself. PINE never reaches the bridge: the
+        // native side has no Pine trampoline, and sending it there is what used to turn a Pine
+        // request into an LSPlant install behind the caller's back.
+        val installed =
+            when (effective) {
+                HookBackend.PINE -> PineBackend.hook(origin, arrayOf(record))
+                else ->
+                    HookBridge.hookMethodWithBackend(
+                        true,
+                        origin,
+                        VectorNativeHooker::class.java,
+                        record.priority,
+                        record,
+                        effective.ordinal,
+                    )
+            }
+
+        if (!installed) {
+            // The engine refused. Drop the claim so a later attempt can retry rather than folding
+            // into an owner that never actually installed.
+            HookBackendSelector.release(site, executableKey)
             throw HookFailedError("Cannot hook $origin")
         }
 
-        val handle = VectorHookHandle(origin, moduleId, record)
+        val handle =
+            VectorHookHandle(origin, moduleId, record, installedBackend = effective)
         if (moduleId != null) {
             VectorHookRegistry.track(moduleId, handle)
             record.id?.let { VectorHookRegistry.claimId(moduleId, origin, it, handle) }

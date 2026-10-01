@@ -11,6 +11,10 @@ coil = "3.5.0"
 # BOM, which resolves material3 to 1.4.0.
 m3 = "1.5.0-alpha26"
 nav3 = "1.1.6"
+# Pine: the second ART hook engine, the alternative to LSPlant. Its own JNI layer and
+# prebuilt .so ship in the AAR, so no external/ subproject is needed.
+# 0.3.0 is the last release and supports Android 4.4 (ART) through 15 beta.
+pine = "0.3.0"
 navigationevent = "1.1.2"
 # Governs every androidx.compose.* artifact below; none of them pin a version.
 compose-bom = "2026.08.00"
@@ -58,6 +62,9 @@ coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref 
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
 
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.11.0" }
+# Pine: alternative ART runtime hook engine. Carries a prebuilt JNI library.
+# Top-level group is top.canyie.pine so the module path is the familiar one.
+top-canyie-pine = { module = "top.canyie.pine:core", version.ref = "pine" }
 
 rikkax-parcelablelist = { module = "dev.rikka.rikkax.parcelablelist:parcelablelist", version = "2.0.1" }
 

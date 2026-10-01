@@ -5,6 +5,7 @@ import io.github.libxposed.api.XposedInterface.ExceptionMode
 import io.github.libxposed.api.XposedInterface.Hooker
 import java.lang.reflect.Executable
 import java.util.Collections
+import org.matrix.vector.impl.hookrule.HookBackend
 import org.matrix.vector.util.Utils
 
 /**
@@ -21,7 +22,27 @@ class VectorHookRecord(
     val priority: Int,
     val exceptionMode: ExceptionMode,
     val id: String?,
-)
+    /**
+     * True for a record that was minted for a hook a profile disabled. Such a record is never
+     * handed to the native layer: it exists only so the module's handle has something to point at,
+     * and it is what [VectorHookHandle.unhook] checks before deciding there is nothing to remove.
+     */
+    val disabled: Boolean = false,
+    /**
+     * Which ART engine installed this record. Defaults to [HookBackend.LSPLANT] because every
+     * record that predates Pine support was an LSPlant one, and the native bridge is the only
+     * path that mints a record without naming an engine.
+     *
+     * An unhook reads this rather than re-asking the selector: the selector answers "what should
+     * own this site", but at unhook time the question is "what *did* own it", and a profile edit
+     * between install and unhook must not be able to change the answer and strand the install.
+     */
+    val backend: HookBackend = HookBackend.LSPLANT,
+) {
+    /** The same record marked as coming from a disabled hook. */
+    fun withDisabledFlag(): VectorHookRecord =
+        VectorHookRecord(hooker, priority, exceptionMode, id, disabled = true, backend = backend)
+}
 
 /**
  * Core interceptor chain engine. Manages recursive hook execution and enforces [ExceptionMode]

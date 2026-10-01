@@ -16,6 +16,25 @@ object HookBridge {
         callback: Any?,
     ): Boolean
 
+    /**
+     * Multi-backend variant: [backendOrdinal] selects the native installation mechanism. The
+     * ordinal of `HookBackend` is passed rather than the enum object so the JNI signature names no
+     * Kotlin class and stays stable under obfuscation. Kept separate from [hookMethod] so the
+     * original 5-argument signature — the one legacy callers and already-built modules bind to —
+     * keeps working unchanged.
+     *
+     * There is deliberately no matching `unhookMethodWithBackend`: unloading keys on the method and
+     * callback, not on how the hook was installed, so [unhookMethod] serves every backend.
+     */
+    @JvmStatic
+    external fun hookMethodWithBackend(
+        useModernApi: Boolean,
+        hookMethod: Executable,
+        hooker: Class<*>,
+        priority: Int,
+        callback: Any?,
+        backendOrdinal: Int,
+    ): Boolean
     @JvmStatic
     external fun unhookMethod(
         useModernApi: Boolean,

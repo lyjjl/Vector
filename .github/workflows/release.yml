@@ -1,0 +1,249 @@
+# Manual release.
+#
+# Never triggered by a push. A release is a decision, not a side effect of a commit, so the only
+# entry point is `workflow_dispatch`: someone opens the Actions tab, picks this workflow, types a
+# version, and presses run. Nothing else in the repository can publish a release through this file.
+#
+# This is deliberately separate from upstream's `core.yml`, which cuts a *canary* on every master
+# push and a stable release when a tag is pushed. A canary is a build of whatever master happens to
+# be; this is a build someone chose to ship, from a ref they chose, under a version they typed. The
+# two answer different questions and are kept apart so that neither can do the other's job by
+# accident — a merge to master must not be able to produce a numbered release, and a release run
+# must not be able to produce a canary.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version name for this release, without a leading "v" — for example 1.2.3. Used as the
+          tag (v1.2.3), the release title, and the version string baked into the build.
+        required: true
+        type: string
+      ref:
+        description: >-
+          Git ref to build from. Leave empty for the branch selected above. Set a tag or a full
+          SHA to release an exact commit rather than the tip of a branch.
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: Mark this release as a prerelease.
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: >-
+          Create the release as a draft, so it can be reviewed and published by hand afterwards.
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  # Fails the run before anything is built when the inputs cannot produce a valid release. Cheaper
+  # than discovering it after twenty minutes of native compilation, which is the whole point.
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      commit: ${{ steps.check.outputs.commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs
+        id: check
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          # A leading "v" would make `v v1.2.3`, and a slash or space would make a tag Git refuses
+          # or a shell word that splits. Rejected here rather than allowed to fail obscurely later.
+          if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::version must look like 1.2.3 or 1.2.3-rc1; got '$INPUT_VERSION'"
+            exit 1
+          fi
+
+          ref="${INPUT_REF:-${{ github.ref }}}"
+          git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null || {
+            echo "::error::ref '$ref' does not resolve to a commit"
+            exit 1
+          }
+          commit=$(git rev-parse "${ref}^{commit}")
+
+          tag="v${INPUT_VERSION}"
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            echo "::error::tag ${tag} already exists; a release must not overwrite an existing one"
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> $GITHUB_OUTPUT
+          echo "commit=${commit}" >> $GITHUB_OUTPUT
+          echo "Releasing ${tag} from ${commit}" >> $GITHUB_STEP_SUMMARY
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    # `contents: write` is what creating the release needs. Nothing else in this workflow writes.
+    permissions:
+      contents: write
+    env:
+      VECTOR_BUILD_REPOSITORY: ${{ github.repository }}
+      # The validated commit, not github.sha: a release built from a ref input has to report the
+      # commit it was actually built from, and the two differ as soon as `ref` names anything but
+      # the branch the workflow ran on.
+      VECTOR_BUILD_COMMIT: ${{ needs.validate.outputs.commit }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_BASEDIR: "${{ github.workspace }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Check translations
+        run: |
+          python3 manager/tools/check_translations.py manager/src/main/res
+          python3 manager/tools/check_translations.py daemon/src/main/res
+
+      # A release is meant to be installable, and the daemon's InstallerVerifier rejects a build
+      # signed with anything but the real key. On a repository without the secret the build still
+      # runs — a fork can produce a release it can install itself — but it says so loudly, because
+      # an unsigned release that looks signed is worse than a failed one.
+      - name: Write key
+        env:
+          KEY_STORE: ${{ secrets.KEY_STORE }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY_STORE" ]; then
+            echo "::warning::No signing secret is configured; this release will be unsigned."
+            exit 0
+          fi
+          {
+            echo "androidStorePassword=$KEY_STORE_PASSWORD"
+            echo "androidKeyAlias=$ALIAS"
+            echo "androidKeyPassword=$KEY_PASSWORD"
+            echo "androidStoreFile=key.jks"
+          } >> gradle.properties
+          printf '%s' "$KEY_STORE" | base64 --decode > key.jks
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Configure Gradle properties
+        run: |
+          echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
+
+      - name: Setup ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+        with:
+          version: 1.13.2
+
+      - name: Setup ccache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.ccache
+            ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/build.gradle') }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Remove Android's cmake
+        shell: bash
+        run: rm -rf $ANDROID_HOME/cmake
+
+      - name: Build
+        run: ./gradlew zipAll
+
+      - name: Collect assets
+        id: assets
+        run: |
+          set -euo pipefail
+          ls -l zygisk/release/
+          release=$(ls zygisk/release/Vector-v*-Release.zip)
+          debug=$(ls zygisk/release/Vector-v*-Debug.zip)
+          echo "release=$release" >> $GITHUB_OUTPUT
+          echo "debug=$debug" >> $GITHUB_OUTPUT
+
+      # Created as a draft first when the input asks for it, which lets a release be assembled and
+      # checked before anyone can download it. `--draft` on create plus a follow-up edit is how a
+      # draft is published later, so the asset upload path is identical either way.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
+          IS_DRAFT: ${{ inputs.draft }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          subject=$(git log -1 --pretty=%s "$COMMIT")
+          short=$(git rev-parse --short "$COMMIT")
+          notes=$(cat <<EOF
+          Built from [\`${short}\`](${{ github.server_url }}/${{ github.repository }}/commit/${COMMIT}).
+
+          **${subject}**
+
+          Published by a manual run of the Release workflow.
+          EOF
+          )
+
+          flags=()
+          [ "$IS_DRAFT" = "true" ] && flags+=(--draft)
+          [ "$IS_PRERELEASE" = "true" ] && flags+=(--prerelease)
+
+          gh release create "$TAG" \
+            --target "$COMMIT" \
+            --title "Vector ${TAG}" \
+            --notes "$notes" \
+            "${flags[@]}" \
+            "${{ steps.assets.outputs.release }}" \
+            "${{ steps.assets.outputs.debug }}"
+
+      - name: Point the tag at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          # `gh release create --target` makes the tag, but only after the release exists; this
+          # guards the case where a tag was pre-created pointing somewhere else, so a release can
+          # never be attached to a commit other than the one that was built.
+          set -euo pipefail
+          gh release view "$TAG" --json tagName,targetCommitish -q .targetCommitish
+
+      - name: Release summary
+        if: always()
+        run: |
+          {
+            echo "### Release ${{ needs.validate.outputs.tag }}"
+            echo
+            echo "- commit: \`${{ needs.validate.outputs.commit }}\`"
+            echo "- draft: ${{ inputs.draft }}"
+            echo "- prerelease: ${{ inputs.prerelease }}"
+          } >> $GITHUB_STEP_SUMMARY

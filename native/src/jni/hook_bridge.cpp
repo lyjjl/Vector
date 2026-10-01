@@ -18,6 +18,65 @@
 
 namespace {
 
+/*
+ * HookBackend ordinals, mirroring org.matrix.vector.impl.hookrule.HookBackend.
+ *
+ * The JNI entry receives the Java enum by ordinal, so the two sides agree on a fixed numbering
+ * rather than on a class name that obfuscation could rename. Keep in step with the Kotlin enum's
+ * declaration order.
+ */
+enum class HookBackendNative : jint {
+    AUTO = 0,
+    LSPLANT = 1,
+    PINE = 2,
+    KPM = 3,
+};
+
+/*
+ * Resolve the effective ART backend on the native side.
+ *
+ * This bridge builds LSPlant trampolines and nothing else. It is deliberately *not* where a
+ * multi-backend choice is made: the Java-side `HookBackendSelector` owns that decision, and the
+ * Kotlin install path already dispatched on its answer, so by the time a request reaches here the
+ * engine has been chosen.
+ *
+ * The distinction that matters is between AUTO and a *wrong* backend:
+ *
+ *   - AUTO and LSPLANT both mean "LSPlant", the only ART engine this file can build.
+ *
+ *   - PINE means the caller expected the Kotlin Pine path to handle it, and something routed a
+ *     Pine hook past that path. Silently building an LSPlant trampoline instead would produce a
+ *     working hook that is not the one the selector recorded as owning the site — the manager
+ *     would report Pine while LSPlant was installed. There is no correct fallback, so we return a
+ *     sentinel the caller turns into a refusal rather than a quiet downgrade.
+ *
+ *   - KPM is a native-layer backend; an ART hook asking for it is a layer confusion the selector
+ *     is supposed to have rejected already. Same treatment: refuse rather than guess.
+ */
+enum class ArtBackendResolution : jint {
+    LSPLANT_OK = 0,
+    UNSUPPORTED = 1,
+};
+
+inline ArtBackendResolution resolve_art_backend(jint ordinal) {
+    switch (static_cast<HookBackendNative>(ordinal)) {
+        case HookBackendNative::AUTO:
+        case HookBackendNative::LSPLANT:
+            return ArtBackendResolution::LSPLANT_OK;
+        case HookBackendNative::PINE:
+            // Pine has its own, Kotlin-level install path; reaching the bridge means that path was
+            // bypassed, and building an LSPlant trampoline here would contradict the selector.
+            LOGE("HookBridge: PINE reached the native ART bridge; it is installed in Kotlin, not here");
+            return ArtBackendResolution::UNSUPPORTED;
+        case HookBackendNative::KPM:
+            LOGE("HookBridge: KPM requested for an ART hook; that is a layer confusion");
+            return ArtBackendResolution::UNSUPPORTED;
+        default:
+            LOGE("HookBridge: unknown ART backend ordinal %d", static_cast<int>(ordinal));
+            return ArtBackendResolution::UNSUPPORTED;
+    }
+}
+
 /**
  * @struct HookItem
  * @brief Holds all state associated with a single hooked method.
@@ -312,8 +371,10 @@ namespace vector::native::jni {
  * @param callback The Java callback object.
  * @return JNI_TRUE on success, JNI_FALSE on failure.
  */
-VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi,
-                         jobject hookMethod, jclass hooker, jint priority, jobject callback) {
+/* Shared installation path. `backendOrdinal` is the requested backend, resolved below. */
+static jboolean hook_method_impl(JNIEnv *env, jboolean useModernApi, jobject hookMethod,
+                                 jclass hooker, jint priority, jobject callback,
+                                 jint backendOrdinal) {
     bool newHook = false;
 
 #ifndef NDEBUG
@@ -356,6 +417,13 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
             hooker, env->GetMethodID(hooker, "callback", "([Ljava/lang/Object;)Ljava/lang/Object;"),
             false);
         auto hooker_object = env->NewObject(hooker, init, hookMethod);
+        // Decide whether this bridge can build the requested engine. It can build LSPlant and
+        // nothing else, so anything else is a refusal *before* any trampoline is created: a hook
+        // that the selector recorded as Pine or KPM must not end up an LSPlant install.
+        if (resolve_art_backend(backendOrdinal) != ArtBackendResolution::LSPLANT_OK) {
+            env->DeleteLocalRef(hooker_object);
+            return JNI_FALSE;
+        }
         // Use lsplant to replace the target method with our trampoline.
         // The returned jobject is a handle to the original method.
         hook_item->SetBackup(lsplant::Hook(env, hookMethod, hooker_object, callback_method));
@@ -377,6 +445,29 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
         hook_item->legacy_callbacks.emplace(priority, env->NewGlobalRef(callback));
     }
     return JNI_TRUE;
+}
+
+/**
+ * @brief The original single-backend entry. Kept verbatim for ABI: this is the 5-argument JNI
+ * signature legacy callers and already-built modules bind to. It forwards to the shared impl with
+ * AUTO, which resolves to the framework's own ART backend.
+ */
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi, jobject hookMethod,
+                         jclass hooker, jint priority, jobject callback) {
+    return hook_method_impl(env, useModernApi, hookMethod, hooker, priority, callback,
+                            static_cast<jint>(HookBackendNative::AUTO));
+}
+
+/**
+ * @brief Multi-backend entry. [backendOrdinal] names the requested backend; the shared impl logs and
+ * resolves it. This is the only difference from #hookMethod, and having two entries rather than one
+ * overloaded signature is what keeps #hookMethod's ABI byte-identical.
+ */
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethodWithBackend, jboolean useModernApi,
+                         jobject hookMethod, jclass hooker, jint priority, jobject callback,
+                         jint backendOrdinal) {
+    return hook_method_impl(env, useModernApi, hookMethod, hooker, priority, callback,
+                            backendOrdinal);
 }
 
 /**
@@ -1077,6 +1168,9 @@ static JNINativeMethod gMethods[] = {
     VECTOR_NATIVE_METHOD(HookBridge, hookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Class;ILjava/"
                          "lang/Object;)Z"),
+    VECTOR_NATIVE_METHOD(HookBridge, hookMethodWithBackend,
+                         "(ZLjava/lang/reflect/Executable;Ljava/lang/Class;ILjava/"
+                         "lang/Object;I)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, unhookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Object;)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, replaceCallback,

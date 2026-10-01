@@ -5,6 +5,8 @@ import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.error.HookFailedError
 import java.lang.reflect.Executable
 import java.util.concurrent.ConcurrentHashMap
+import org.matrix.vector.impl.hookrule.HookBackend
+import org.matrix.vector.impl.hookrule.PineBackend
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
@@ -42,10 +44,32 @@ internal object VectorHookRegistry {
     fun track(moduleId: String, handle: VectorHookHandle) {
         byModule.computeIfAbsent(moduleId) { ConcurrentHashMap.newKeySet() }.add(handle)
     }
-
     fun forget(moduleId: String, handle: VectorHookHandle) {
         byModule[moduleId]?.remove(handle)
     }
+
+    /**
+     * Mints a live but inert handle for a hook the profile disabled.
+     *
+     * The module asked for a hook and gets a handle back; the handle is trackable and unhookable
+     * like any other, but no native record was ever installed for it. Returning a real handle rather
+     * than null is what keeps a module's own bookkeeping from noticing the difference: code that
+     * holds the handle, stores it, or calls [VectorHookHandle.unhook] on it keeps working.
+     *
+     * The handle is *not* entered in the id table: nothing installs under that id while it is
+     * disabled, so a later re-registration of the same id must be free to install normally.
+     */
+    fun registerDisabled(
+        origin: Executable,
+        moduleId: String,
+        id: String,
+        record: VectorHookRecord,
+    ): VectorHookHandle {
+        val handle = VectorHookHandle(origin, moduleId, record.withDisabledFlag())
+        track(moduleId, handle)
+        return handle
+    }
+
 
     /** The hooks of [moduleId] that are still installed, for `HotReloadedParam#getOldHookHandles`. */
     fun liveHandles(moduleId: String): List<HookHandle> =
@@ -68,10 +92,21 @@ internal constructor(
     private val origin: Executable,
     private val moduleId: String?,
     initialRecord: VectorHookRecord,
+    installedBackend: HookBackend = initialRecord.backend,
 ) : HookHandle {
 
     @Volatile
-    internal var record: VectorHookRecord = initialRecord
+    internal var record: VectorHookRecord =
+        if (installedBackend == initialRecord.backend) initialRecord
+        else
+            VectorHookRecord(
+                initialRecord.hooker,
+                initialRecord.priority,
+                initialRecord.exceptionMode,
+                initialRecord.id,
+                initialRecord.disabled,
+                installedBackend,
+            )
         private set
 
     @Volatile
@@ -88,7 +123,13 @@ internal constructor(
                 if (!isLive) return
                 isLive = false
             }
-            HookBridge.unhookMethod(true, origin, record)
+            // A disabled hook has no native record; there is nothing to remove.
+            if (record.disabled) return
+            // A framework hook is never installed through Pine - it has no module, so no rule,
+            // so the selector never sees it - which makes the native bridge unconditionally right
+            // here. The dispatch is still written out so the two unhook paths stay legible as a pair.
+            if (record.backend == HookBackend.PINE) PineBackend.unhook(origin)
+            else HookBridge.unhookMethod(true, origin, record)
             return
         }
         synchronized(VectorHookRegistry.lockOf(moduleId)) {
@@ -98,7 +139,14 @@ internal constructor(
             isLive = false
             record.id?.let { VectorHookRegistry.releaseId(moduleId, origin, it, this) }
             VectorHookRegistry.forget(moduleId, this)
-            HookBridge.unhookMethod(true, origin, record)
+            // A disabled hook was never installed, so there is nothing to unhook natively.
+            if (record.disabled) return
+            // Which engine installed this decides which one tears it down. This is why the record
+            // carries the backend: re-asking the selector here could answer differently if the
+            // profile was edited after install, and an unhook aimed at the wrong engine either
+            // no-ops (leaving a live hook) or removes a trampoline it does not own.
+            if (record.backend == HookBackend.PINE) PineBackend.unhook(origin)
+            else HookBridge.unhookMethod(true, origin, record)
         }
     }
 

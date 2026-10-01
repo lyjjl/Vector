@@ -46,4 +46,8 @@ dependencies {
     compileOnly(libs.androidx.annotation)
     compileOnly(libs.libxposed.annotation)
     compileOnly(projects.hiddenapi.stubs)
+    // The Pine ART engine. A real implementation dependency, not compileOnly: the
+    // classes are loaded reflectively only when a rule selects PINE, but the engine
+    // itself must ship inside the framework image, and its .so comes along in the AAR.
+    implementation(libs.top.canyie.pine)
 }

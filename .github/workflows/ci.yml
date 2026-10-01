@@ -1,0 +1,131 @@
+# Continuous integration.
+#
+# Runs on every push and every pull request and does one thing: prove the tree builds. It publishes
+# nothing — no canary, no release, no tag. That separation is deliberate. Upstream's `core.yml`
+# already owns publication on this repository; this workflow's only job is to answer "did this
+# commit break the build" as fast and as legibly as it can, so a regression surfaces on the PR that
+# caused it rather than on the canary that shipped it.
+#
+# The build is the fork's, not upstream's: it exists to exercise the hook-rule layer and the Pine
+# backend this fork adds, alongside everything upstream already builds. `zipAll` is what upstream
+# uses and it is what runs here, so the artifact is the same shape a real install consumes.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # Allows a manual run against any ref, which is what to reach for when a build is suspected of
+  # being flaky rather than broken — the same commit, run again, without an empty commit to trigger it.
+  workflow_dispatch:
+
+# A newer push to the same branch makes an older run pointless: it is testing a tree nobody will
+# merge. Cancelling keeps the queue short, which matters most on the PR branches that see the most
+# pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Read-only. This job has no reason to write anything back to the repository.
+    permissions:
+      contents: read
+    env:
+      # The version string the manager and module.prop carry. On a pull request the defaults would
+      # describe the run rather than the code — GITHUB_SHA is an ephemeral merge commit that exists
+      # nowhere — so the head ref is used there, where a reader can actually go and look at it.
+      VECTOR_BUILD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      VECTOR_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_BASEDIR: "${{ github.workspace }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          # The version code is the commit count, so the history has to be there to count.
+          fetch-depth: 0
+
+      - name: Check translations
+        run: |
+          python3 manager/tools/check_translations.py manager/src/main/res
+          python3 manager/tools/check_translations.py daemon/src/main/res
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Configure Gradle properties
+        run: |
+          echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
+
+      - name: Setup ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+        with:
+          version: 1.13.2
+
+      - name: Setup ccache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.ccache
+            ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/build.gradle') }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      # The SDK ships its own cmake, and Gradle would prefer it over the ninja/cmake this job set
+      # up above. Removing it is upstream's fix and is kept here so both workflows build the native
+      # side the same way.
+      - name: Remove Android's cmake
+        shell: bash
+        run: rm -rf $ANDROID_HOME/cmake
+
+      # No signing secrets on a fork, and none wanted: an unsigned debug build is enough to prove
+      # the tree compiles, and this job publishes nothing that would need a signature.
+      - name: Build
+        run: ./gradlew zipAll
+
+      - name: Record build summary
+        if: always()
+        run: |
+          {
+            echo "### Build ${{ job.status }}"
+            echo
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- ref: \`${{ github.ref }}\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload build outputs
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vector-ci-${{ github.sha }}
+          # The zips a user would install, plus the maps and symbols needed to read a stack trace
+          # from one of them. A CI artifact nobody can debug with is only half an artifact.
+          path: |
+            zygisk/release/Vector-v*-Release.zip
+            zygisk/release/Vector-v*-Debug.zip
+            zygisk/build/outputs/mapping
+            manager/build/outputs/mapping
+            daemon/build/outputs/mapping
+            zygisk/build/symbols
+            daemon/build/symbols
+            dex2oat/build/symbols
+          if-no-files-found: warn
+          retention-days: 14
